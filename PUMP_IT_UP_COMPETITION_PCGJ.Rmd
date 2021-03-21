@@ -1,0 +1,460 @@
+---
+title: 'Pump it up: Data Mining the Water Table'
+author: "José Ignacio Fernández / Guillermo Gómez / Paula Zarate / Carlos Redondo"
+date: "20/3/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### INTRODUCTION
+
+The objective of the competition is to predict the performance of water pumps in Tanzania, so we are faced with a multiclass classification problem where the response variable "status_group" consists of three levels:
+
+* Functional
+* Functional needs repair
+* non functional
+
+To do so, we will make use of a number of input variables. For more information about the contest, please see the following [link](https://www.drivendata.org/competitions/7/pump-it-up-data-mining-the-water-table/page/25/).
+
+### LOADING LIBRARIES AS WELL AS AVAILABLE DATA SETS 
+
+```{r carga_informacion, warning=F, message=F}
+# Librerias
+library(data.table)
+library(dplyr)
+library(tidyverse)
+library(inspectdf) 
+library(forcats)
+library(ggplot2)
+library(ranger)
+library(caret)
+
+# Carga de información
+
+data_train <- fread("train.csv")
+data_labels <- fread("train_labels.csv")
+data_test <- fread("test.csv")
+
+```
+
+Next, to perform the descriptive analysis of the data (EDA) as well as the possible cleaning of the data, we created a new data set that we have named all_data where all the records of both the training dataset (data_train) and the test dataset (data_test) are grouped.
+
+Additionally, I would like to comment that we have proceeded to transform the type of the variables from character to factor to facilitate the manipulation and analysis of the data.
+
+
+```{r union, warning=F, message=F}
+# TRAINING + TARGET
+all_train <- merge(data_train, data_labels)
+
+# DATA + TEST 
+all_data <- rbind(all_train, data_test, fill = TRUE) %>%
+    as.data.table() # TRAIN + TEST
+    
+# DATASET COPY
+all_data_mod <- copy(all_data)
+
+# CHARACTER TO FACTOR
+all_data_mod <- all_data_mod %>% mutate_if(is.character,as.factor)
+
+```
+
+### EXPLORATORY DATA ANALYSIS (EDA)
+
+First, we proceed to analyze the information provided to us.
+
+```{r eda_1, warning=F, message=F}
+summary(all_data_mod)
+```
+
+It appears that there are variables such as payment / payment_type, water_quality / quality_group, etc that are similar to each other. We zoom in on that set of variables.
+
+```{r eda_2, warning=F, message=F}
+summary(all_data_mod[,c("payment", "payment_type"
+                        ,"extraction_type", "extraction_type_group", "extraction_type_class",
+                        "management" , "management_group",
+                        "water_quality" , "quality_group",
+                        "quantity", "quantity_group",
+                        "source" , "source_type" , "source_class",
+                        "waterpoint_type", "waterpoint_type_group")])
+```
+
+We observe how there are variables with identical records and groupings. Others have similar groupings. We could (and in the future may) carry out an in-depth analysis of these variables. However, here we will perform a brief analysis of some of the above variables and directly eliminate those that seem to us to provide less information either because they are too closely grouped or because they have too many different categories. 
+
+```{r eda_3, warning=F, message=F}
+summary(all_data_mod[,c("payment", "payment_type"
+                        ,"extraction_type", "extraction_type_group", "extraction_type_class",
+                        "management" , "management_group",
+                        "water_quality" , "quality_group",
+                        "quantity", "quantity_group",
+                        "source" , "source_type" , "source_class",
+                        "waterpoint_type", "waterpoint_type_group")])
+```
+
+Next, we focus on the target variable: status_group.
+
+```{r eda_4, warning=F, message=F}
+# TARGET VARIABLE
+
+barplot(table(data_labels$status_group), col = 'darkblue')
+```
+
+It can be seen in the graph as there is a great majority of pumps that are in operation or not working, while the group of "working in need of repair" is the one with the lowest number of records. This could be an unbalanced target variable.
+
+Next, we will analyze the input variables. To do this, we will make use of a library that allows us to obtain a quick view of the histograms of the numerical variables, as well as the existing correlations or missing in our data set.
+
+```{r eda_5, warning=F, message=F}
+# HISTOGRAMS
+x <- inspect_num(all_data_mod)
+show_plot(x)
+
+# CORRELATIONS
+x <- inspect_cor(all_data_mod)
+show_plot(x)
+
+# MISSINGS
+x <- inspect_na(all_data_mod)
+show_plot(x)
+
+```
+
+We can see how there are variables that will not contribute value to the prediction, such as Id or Num_Private.  We can also observe how there are variables with 0s in a disproportionate way, so we may be in the presence of "hidden" missings. In addition, we can see how there are approximately 5% of missings for Public Meeting and Permit (we do not consider status group because when joining Test & Train, Test records have been filled as NAs and this will not be a problem because to finish and generate the model we will separate it again in Train and Test). Finally, we see how there is an interesting correlation between District Code and Region Code so we will have to deal with it.
+
+To conclude this section, we briefly reflect on some of the variables that we mentioned at the beginning and that seemed to be closely related:
+
+```{r eda_6, warning=F, message=F}
+# QUANTITY & QUANTITY_GROUP
+table(all_data_mod$quantity, all_data_mod$status_group)
+table(all_data_mod$quantity_group, all_data_mod$status_group)
+
+# PAYMENT & PAYMENT_TYPE
+table(all_data_mod$payment, all_data_mod$status_group)
+table(all_data_mod$payment_type, all_data_mod$status_group)
+
+# EXTRACTION / EXTRACTION_TYPE_CLASS, EXTRACTION_TYPE_GROUP
+table(all_data_mod$extraction_type, all_data_mod$status_group)
+table(all_data_mod$extraction_type_group, all_data_mod$status_group)
+table(all_data_mod$extraction_type_class, all_data_mod$status_group)
+    
+
+```
+
+We can see how the Quantity & Quantity_group variables are identical, how between payment & payment_type they have the same division of categories with different names or how between the extraction variables the three variables provide more or less information depending on the number of categories.
+
+
+## DATA CLEANING & FEATURE ENGINEERING
+
+At this stage, we will dedicate ourselves to cleaning the data set as well as creating new variables that may provide us with information to predict the target variable.
+
+#### 1 - We eliminated the variables that were similar, as well as num_private and recorded_by
+
+```{r Limpieza_variables_repetidas, warning=F, message=F}
+all_data_mod <- all_data_mod[, - c("payment_type"
+                                   ,"extraction_type_class", "extraction_type",
+                                   "management",
+                                   "quality_group",
+                                   "quantity_group",
+                                   "source_type", "source_class",
+                                   "waterpoint_type_group",
+                                   # "id"
+                                   "num_private", "recorded_by")]
+
+```
+
+
+#### 2 - Impute the NAs of public_meeeting & permit to a new variable that we call "Desconocido".
+
+```{r Limpieza_permit_public, warning=F, message=F}
+all_data_mod$permit <- as.character(all_data_mod$permit)
+all_data_mod$public_meeting <- as.character(all_data_mod$public_meeting)
+all_data_mod$permit[sapply(all_data_mod$permit, is.na)] <- "Desconocido"
+all_data_mod$public_meeting[sapply(all_data_mod$public_meeting, is.na)] <- "Desconocido"
+all_data_mod$permit <- as.factor(all_data_mod$permit)
+all_data_mod$public_meeting <- as.factor(all_data_mod$public_meeting)
+
+```
+
+#### 3 - Modify the date_recorded variable
+
+This variable, in date format, will be converted into two variables: Month and Year. Moreover, in Tanzania it is known that there are seasons depending on how much it rains (Long Rainy seasons) or, on the contrary, months where the climate is very dry. Therefore, we consider that this variable could be of interest. 
+
+```{r limpieza_date, warning=F, message=F}
+
+all_data_mod$fe_anio    <- year(all_data_mod$date_recorded)
+all_data_mod$fe_mes     <- month(all_data_mod$date_recorded)
+
+long_rainy_season <- c(3, 4, 5)
+long_dry_season <- c(6, 7, 8, 9, 10)
+short_dry_season <- c(1,2)
+short_rainy_season <- c(11, 12)
+all_data_mod$season <- ifelse(all_data_mod$fe_mes %in% long_rainy_season, "Long Rainy", ifelse(all_data_mod$fe_mes  %in% long_dry_season, "Long Dry",
+                                                                                               ifelse(all_data_mod$fe_mes  %in% short_dry_season, "Short Dry", "Short Rainy")))  
+
+all_data_mod$season <- as.factor(all_data_mod$season)
+
+all_data_mod$date_recorded <- NULL
+
+```
+
+#### 4 - GPS HEIGHT
+
+This variable was observed in the summary() that had negative values and the lowest point of Tanzania is the sea level (0 m) so they are erroneous values. 
+
+To impure them we perform a process that we will repeat with other variables such as population. We will group the gps_height data by region and impute the NAs based on the median value for each region.  In this way we try to reduce the probability of imputing values that are far away from the real value.
+
+```{r GPS, warning=F, message=F}
+# Impute negative values and 0s (possible NAs) to NA
+all_data_mod$gps_height[all_data_mod$gps_height <= 0 ] <- NA
+
+# To refine, we group by region
+Region_GPS<- all_data_mod %>%
+    group_by(region) %>%
+    summarize(re_gps_height = median(gps_height, na.rm = TRUE))
+
+# Some regions have no value (NAs) 
+
+Region_GPS$re_gps_height <- ifelse(Region_GPS$region == "Dodoma", 1483,  # Manyara
+                                   ifelse(Region_GPS$region == "Kagera", 1295, # Mara
+                                          ifelse(Region_GPS$region == "Mbeya",1720, # Iringa
+                                                 ifelse(Region_GPS$region == "Tabora", 1274, Region_GPS$re_gps_height)))) # Kigoma
+
+all_data_mod <- merge(all_data_mod, Region_GPS, by = 'region')
+
+all_data_mod$fe_gps_height <- ifelse(is.na(all_data_mod$gps_height), all_data_mod$re_gps_height, all_data_mod$gps_height)
+
+all_data_mod$gps_height <- NULL
+all_data_mod$re_gps_height <- NULL
+
+```
+
+#### 5 - DISTRICT CODE & REGION CODE
+
+Since they were highly correlated, we created a new joint variable to eliminate the potential collinearity problem.
+
+```{r dregion, warning=F, message=F}
+
+all_data_mod$district_region_code <- paste(all_data_mod$district_code, all_data_mod$region_code, sep = "")
+all_data_mod$district_region_code  <- as.factor(all_data_mod$district_region_code )
+
+all_data_mod$district_code <- NULL
+all_data_mod$region_code <- NULL
+
+```
+
+#### 5 - CONSTRUCTION YEAR
+
+The year of construction of the pump has a very high number of 0s so we consider them as nulls. To solve this problem, we will impute these nulls as a function of the region in which the pump was built.
+
+```{r year, warning=F, message=F}
+
+all_data_mod$construction_year[all_data_mod$construction_year == 0] <- NA
+
+Region_Anio_Construccion<- all_data_mod %>%
+    group_by(region) %>%
+    summarize(re_anio = median(construction_year, na.rm = TRUE))
+
+
+Region_Anio_Construccion <- Region_Anio_Construccion %>%
+    replace_na(list(re_anio = median(Region_Anio_Construccion$re_anio, na.rm = TRUE) ))
+
+
+all_data_mod <- merge(all_data_mod, Region_Anio_Construccion, by = 'region')
+
+
+all_data_mod$fe_anio_construccion <- ifelse(is.na(all_data_mod$construction_year), all_data_mod$re_anio, all_data_mod$construction_year)
+
+all_data_mod$construction_year <- NULL
+all_data_mod$re_anio <- NULL
+
+```
+
+#### 6 - PUMP AGE
+
+Knowing the year in which the pump was built together with the year in which a certain record was obtained (date_recorded converted to fe_year), we can obtain the life of the pump which can be interesting to predict the response variable.
+
+```{r pump_age, warning=F, message=F}
+
+all_data_mod$pump_age <- all_data_mod$fe_anio - all_data_mod$fe_anio_construccion
+
+summary(all_data_mod$pump_age)
+
+# Los valores negativos los reemplazamos por median
+all_data_mod$pump_age <- ifelse(all_data_mod$pump_age < 0 , median(all_data_mod$pump_age), all_data_mod$pump_age)
+
+
+```
+
+#### 7 - LONGITUDE AND LATITUDE
+
+Tanzania has, approximately, a longitude of 34º while its latitude is slightly negative. With this, we can determine if there are values that do not fit in the data set. In our case, for longitude there are values close to zero so they could be NAs. To impute them, we will do it according to the region as we have done previously with other variables.
+
+Finally, we create a new variable that will be a combination of the two previous ones (the distance).
+
+```{r long_lat, warning=F, message=F}
+
+hist(all_data_mod$latitud) 
+hist(all_data_mod$longitud)
+
+
+all_data_mod$longitude[all_data_mod$longitude == 0] <- NA
+
+Region_Longitude <- all_data_mod %>%
+    group_by(region) %>%
+    summarize(re_longitude = mean(longitude, na.rm = TRUE))
+
+all_data_mod2 <- copy(all_data_mod)
+all_data_mod2 <- merge(all_data_mod2, Region_Longitude, by = 'region')
+
+all_data_mod2$fe_longitude <- ifelse(is.na(all_data_mod2$longitude), all_data_mod2$re_longitude, all_data_mod2$longitude)
+
+all_data_mod2$longitude <- NULL
+all_data_mod2$re_longitude <- NULL
+
+
+all_data_mod2$fe_lonlat <- sqrt(all_data_mod2$fe_longitude^2 + all_data_mod2$latitude^2)
+all_data_mod2$fe_longitude <- NULL
+all_data_mod2$latitude <- NULL
+```
+
+#### 8 - POPULATION
+
+For the population, again, we see how there are values that are 0s. These values will be NAs and, therefore, we must impute them following the above procedure.
+
+```{r population, warning=F, message=F}
+hist(all_data_mod2$population) 
+
+all_data_mod2$population[all_data_mod2$population == 0] <- NA
+
+Region_Poblacion<- all_data_mod2 %>%
+    group_by(region) %>%
+    summarize(re_population = median(population, na.rm = TRUE))
+
+Region_Poblacion <- Region_Poblacion %>%
+    replace_na(list(re_population = median(Region_Poblacion$re_population, na.rm = TRUE) ))
+
+all_data_mod3 <- copy(all_data_mod2)
+all_data_mod3 <- merge(all_data_mod3, Region_Poblacion, by = 'region')
+all_data_mod3$fe_population <- ifelse(is.na(all_data_mod3$population), all_data_mod3$re_population, all_data_mod3$population)
+
+
+all_data_mod3$population <- NULL
+all_data_mod3$re_population <- NULL
+
+```
+
+#### 9 - AMOUNT_TSH
+
+In this case, this variable also has 0s like the rest but, nevertheless, given that there is a fairly direct relationship with the target variable, we proceed to eliminate it from the dataset since if we were to try to impute it following the previous procedure, we might generate a biased model. 
+
+```{r amount, warning=F, message=F}
+all_data_mod4 <- copy(all_data_mod3)
+
+all_data_mod4$amount_tsh <- NULL
+
+```
+
+
+#### 14 - SCHEME_MANAGEMENT
+
+Impute the "None "s to a new category we call "Unknown".
+
+
+```{r scheme_management, warning=F, message=F}
+all_data_mod4$scheme_management <- as.character(all_data_mod4$scheme_management)
+all_data_mod4$scheme_management[all_data_mod4$scheme_management=="None"] <- ""
+all_data_mod4$scheme_management[all_data_mod4$scheme_management==""] <- "Desconocido"
+all_data_mod4$scheme_management <- as.factor(all_data_mod4$scheme_management)
+all_data_mod4$scheme_management <- as.factor(all_data_mod4$scheme_management)
+
+```
+
+#### 15 - OTHER VARIABLES
+
+In addition to Scheme_management, there are other variables that have values such as "none", "None", "unkown", "". So we create a function that goes through the categorical variables and groups those records under the set "Unknown".
+
+```{r otras_var, warning=F, message=F}
+all_data_mod5 <- copy(all_data_mod4)
+all_data_mod5 <- as.data.frame(all_data_mod5)
+col_cat <- names(all_data_mod5)[mapply(class, all_data_mod5) == "factor"]
+col_cat <- col_cat[-20] # Para eliminar status_group
+
+na_values <- c(" ", "", "unknown", "Unknown","None", "none")
+for (name in col_cat){
+    for (i in na_values){
+        all_data_mod5[,name] <- as.character(all_data_mod5[, name])
+        all_data_mod5[,name][all_data_mod5[,name] == i] <- 'Desconocido'
+        all_data_mod5[,name] <- as.factor(all_data_mod5[, name])
+    }
+}
+```
+
+
+#### 16 - CATEGORICAL VARIABLES TO FREQUENCIES
+
+Given that the data set is almost entirely made up of categorical variables with a very large number of categories, we proceed, from a loop, to create new variables where we record the frequencies of each of the levels of the categorical variables.
+
+
+```{r categoricas_freq, warning=F, message=F}
+all_data_mod5 <- as.data.table(all_data_mod5)
+
+for (i in 1:length(col_cat)) {
+    all_data_mod5[, paste(col_cat[i], 'freq', sep = '_') := as.numeric(.N), by = eval(col_cat[i])]
+    all_data_mod5[,col_cat[i]] <- NULL
+}
+
+```
+
+#### 17 - TRAIN & TEST SET PREPARATION
+
+Finally, we prepare the train and test set.
+
+```{r train_test, warning=F, message=F}
+all_data_mod5 <- as.data.table(all_data_mod5)
+train <- all_data_mod5[!is.na(all_data_mod5$status_group)]
+test <- all_data_mod5[is.na(all_data_mod5$status_group)]
+
+train$id <- NULL
+test$status_group <- NULL
+
+```
+
+## RANGER-RANDOM FOREST MODEL
+
+We generate a Random Forest model from the ranger() function, make the predictions and export the results. Note that there is additional code because when performing the merge in the cleaning & feature engineering phase, the test records were disordered, so we make a join by "id" and, in this way, we obtain the predictions in the required order.
+
+
+```{r modelo, warning=F, message=F}
+numCor <- parallel::detectCores() - 2
+doParallel::registerDoParallel(cores = numCor)
+
+mmodelo <- ranger( 
+    as.factor(status_group) ~ .,
+    data = train, importance = 'impurity',
+    num.trees = 1000,
+    mtry =  5,
+    min.node.size = 1,
+    splitrule = 'gini',
+    verbose = TRUE)
+
+predictions <- predict(mmodelo, test)
+
+predictions_df <-as.data.frame(predictions$predictions)
+id_test <- data.frame(id = data_test$id)
+predicciones_id <- data.frame(id = test$id, status_group = predictions_df$predict)
+
+predicciones_final <- merge(x = id_test, y = predicciones_id, by = "id", all.x = TRUE, sort = F)
+
+cat("saving the submission file\n")
+
+file_out <- c("CarPaJoMo_ranger.csv")
+
+write.csv(predicciones_final, file = file_out, row.names = F)
+
+# saveRDS(mmodelo, "modelo_ranger.rds")
+
+```
+
+
+
