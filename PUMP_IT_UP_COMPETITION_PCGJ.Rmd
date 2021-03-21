@@ -1,7 +1,7 @@
 ---
 title: 'Pump it up: Data Mining the Water Table'
-author: "José Ignacio Fernández / Guillermo Gómez / Paula Zarate / Carlos Redondo"
-date: "20/3/2021"
+author: "José Ignacio Fernández Villafáñez / Guillermo Gómez Limia / Paula Zarate Bobran / Carlos Redondo Santos"
+date: "21/3/2021"
 output: html_document
 ---
 
